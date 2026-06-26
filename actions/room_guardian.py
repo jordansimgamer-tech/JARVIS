@@ -1,6 +1,7 @@
 """
-Room Guardian - Face recognition security system for JARVIS
+Room Guardian - Face recognition security system for JARVIS (MediaPipe version)
 Monitors room while you're away and provides updates when you return
+Uses MediaPipe for better compatibility
 """
 
 import cv2
@@ -10,41 +11,46 @@ from datetime import datetime
 from pathlib import Path
 import threading
 import time
-import face_recognition
-from collections import defaultdict
+import numpy as np
+import mediapipe as mp
+from scipy.spatial import distance
 
 # Get base directory
 BASE_DIR = Path(__file__).resolve().parent.parent
 GUARDIAN_DIR = BASE_DIR / "data" / "room_guardian"
-FACE_ENCODINGS_FILE = GUARDIAN_DIR / "face_encodings.pkl"
+FACE_EMBEDDINGS_FILE = GUARDIAN_DIR / "face_embeddings.pkl"
 EVENTS_LOG_FILE = GUARDIAN_DIR / "events.log"
 
 # Ensure directory exists
 GUARDIAN_DIR.mkdir(parents=True, exist_ok=True)
 
+# MediaPipe initialization
+mp_face_detection = mp.solutions.face_detection
+mp_drawing = mp.solutions.drawing_utils
+
 # Global state
 guardian_state = {
     "active": False,
-    "user_face_encoding": None,
+    "user_face_embedding": None,
     "events": [],
     "last_detection": None,
 }
 
 
-def _ensure_face_encodings():
-    """Load or initialize face encodings."""
-    if FACE_ENCODINGS_FILE.exists():
-        with open(FACE_ENCODINGS_FILE, "rb") as f:
-            guardian_state["user_face_encoding"] = pickle.load(f)
+def _ensure_face_embeddings():
+    """Load or initialize face embeddings."""
+    if FACE_EMBEDDINGS_FILE.exists():
+        with open(FACE_EMBEDDINGS_FILE, "rb") as f:
+            guardian_state["user_face_embedding"] = pickle.load(f)
     else:
-        guardian_state["user_face_encoding"] = None
+        guardian_state["user_face_embedding"] = None
 
 
-def _save_face_encoding(encoding):
-    """Save user's face encoding."""
-    with open(FACE_ENCODINGS_FILE, "wb") as f:
-        pickle.dump(encoding, f)
-    guardian_state["user_face_encoding"] = encoding
+def _save_face_embedding(embedding):
+    """Save user's face embedding."""
+    with open(FACE_EMBEDDINGS_FILE, "wb") as f:
+        pickle.dump(embedding, f)
+    guardian_state["user_face_embedding"] = embedding
 
 
 def _log_event(event_type: str, details: str):
@@ -64,6 +70,39 @@ def _log_event(event_type: str, details: str):
     print(f"[Guardian] 📝 {event_entry}")
 
 
+def _extract_face_embedding(frame, detection):
+    """Extract face embedding from a detected face using bounding box."""
+    h, w, c = frame.shape
+    bbox = detection.location_data.relative_bounding_box
+    
+    # Convert relative coordinates to pixel coordinates
+    x_min = int(bbox.xmin * w)
+    y_min = int(bbox.ymin * h)
+    x_max = int((bbox.xmin + bbox.width) * w)
+    y_max = int((bbox.ymin + bbox.height) * h)
+    
+    # Ensure coordinates are within bounds
+    x_min = max(0, x_min)
+    y_min = max(0, y_min)
+    x_max = min(w, x_max)
+    y_max = min(h, y_max)
+    
+    # Extract face region
+    face_region = frame[y_min:y_max, x_min:x_max]
+    
+    # Simple embedding: average RGB values + histogram
+    if face_region.size > 0:
+        avg_color = np.mean(face_region, axis=(0, 1))
+        hist = cv2.calcHist([face_region], [0, 1, 2], None, [8, 8, 8], 
+                            [0, 256, 0, 256, 0, 256])
+        hist = cv2.normalize(hist, hist).flatten()
+        
+        embedding = np.concatenate([avg_color, hist[:20]])  # Simplified embedding
+        return embedding
+    
+    return None
+
+
 def learn_face(player=None) -> str:
     """
     Learn the user's face for recognition.
@@ -77,37 +116,42 @@ def learn_face(player=None) -> str:
         if not cap.isOpened():
             return "❌ Camera not found"
         
-        face_encodings = []
+        face_embeddings = []
         start_time = time.time()
         
-        while time.time() - start_time < 3:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        with mp_face_detection.FaceDetection(
+            model_selection=0, min_detection_confidence=0.5) as face_detection:
             
-            # Find faces in frame
-            face_locations = face_recognition.face_locations(frame)
-            frame_encodings = face_recognition.face_encodings(frame, face_locations)
-            
-            if frame_encodings:
-                face_encodings.extend(frame_encodings)
-            
-            # Show preview (optional)
-            cv2.imshow("Face Registration", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            while time.time() - start_time < 3:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Convert to RGB
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                results = face_detection.process(rgb_frame)
+                
+                if results.detections:
+                    for detection in results.detections:
+                        embedding = _extract_face_embedding(frame, detection)
+                        if embedding is not None:
+                            face_embeddings.append(embedding)
+                
+                # Show preview
+                cv2.imshow("Face Registration", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
         
         cap.release()
         cv2.destroyAllWindows()
         
-        if not face_encodings:
+        if not face_embeddings:
             return "❌ No face detected. Please try again in good lighting"
         
-        # Average the encodings for better accuracy
-        import numpy as np
-        avg_encoding = np.mean(face_encodings, axis=0)
+        # Average the embeddings for better accuracy
+        avg_embedding = np.mean(face_embeddings, axis=0)
         
-        _save_face_encoding(avg_encoding)
+        _save_face_embedding(avg_embedding)
         _log_event("REGISTRATION", "User face registered")
         
         if player:
@@ -122,9 +166,9 @@ def learn_face(player=None) -> str:
 def start_monitoring(player=None) -> str:
     """Start room monitoring when you leave."""
     try:
-        _ensure_face_encodings()
+        _ensure_face_embeddings()
         
-        if not guardian_state["user_face_encoding"] is not None:
+        if guardian_state["user_face_embedding"] is None:
             return "❌ Please register your face first with 'learn my face'"
         
         guardian_state["active"] = True
@@ -168,45 +212,48 @@ def _monitor_room(player=None):
     
     print("[Guardian] 🎥 Monitoring started")
     
-    while guardian_state["active"]:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    with mp_face_detection.FaceDetection(
+        model_selection=0, min_detection_confidence=0.5) as face_detection:
         
-        # Find faces in frame
-        face_locations = face_recognition.face_locations(frame)
-        frame_encodings = face_recognition.face_encodings(frame, face_locations)
-        
-        for face_encoding in frame_encodings:
-            # Compare with user's face
-            matches = face_recognition.compare_faces(
-                [guardian_state["user_face_encoding"]],
-                face_encoding,
-                tolerance=0.6
-            )
+        while guardian_state["active"]:
+            ret, frame = cap.read()
+            if not ret:
+                break
             
-            if matches[0]:
-                # User detected
-                event_msg = "You detected in room"
-                _log_event("USER_DETECTED", event_msg)
-                guardian_state["last_detection"] = {
-                    "type": "user",
-                    "time": datetime.now()
-                }
-            else:
-                # Unknown person detected
-                event_msg = "Unknown person detected in room!"
-                _log_event("UNKNOWN_DETECTED", event_msg)
-                
-                if player:
-                    player.ui.write_log(f"⚠️ {event_msg}")
-                
-                guardian_state["last_detection"] = {
-                    "type": "unknown",
-                    "time": datetime.now()
-                }
-        
-        time.sleep(1)  # Check every second
+            # Convert to RGB
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = face_detection.process(rgb_frame)
+            
+            if results.detections:
+                for detection in results.detections:
+                    embedding = _extract_face_embedding(frame, detection)
+                    
+                    if embedding is not None and guardian_state["user_face_embedding"] is not None:
+                        # Calculate distance between embeddings
+                        dist = distance.euclidean(embedding, guardian_state["user_face_embedding"])
+                        
+                        # If distance is small, it's the user
+                        if dist < 20:  # Threshold for similarity
+                            event_msg = "You detected in room"
+                            _log_event("USER_DETECTED", event_msg)
+                            guardian_state["last_detection"] = {
+                                "type": "user",
+                                "time": datetime.now()
+                            }
+                        else:
+                            # Unknown person
+                            event_msg = "Unknown person detected in room!"
+                            _log_event("UNKNOWN_DETECTED", event_msg)
+                            
+                            if player:
+                                player.ui.write_log(f"⚠️ {event_msg}")
+                            
+                            guardian_state["last_detection"] = {
+                                "type": "unknown",
+                                "time": datetime.now()
+                            }
+            
+            time.sleep(1)  # Check every second
     
     cap.release()
     print("[Guardian] 🎥 Monitoring stopped")
