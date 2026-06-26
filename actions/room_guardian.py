@@ -12,8 +12,17 @@ from pathlib import Path
 import threading
 import time
 import numpy as np
-import mediapipe as mp
 from scipy.spatial import distance
+
+# Try to import mediapipe correctly
+try:
+    import mediapipe as mp
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+except ImportError:
+    # Fallback: use simpler face detection via OpenCV
+    mp = None
+    print("[Guardian] MediaPipe not available, using OpenCV cascade classifier")
 
 # Get base directory
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -24,9 +33,10 @@ EVENTS_LOG_FILE = GUARDIAN_DIR / "events.log"
 # Ensure directory exists
 GUARDIAN_DIR.mkdir(parents=True, exist_ok=True)
 
-# MediaPipe initialization
-mp_face_detection = mp.solutions.face_detection
-mp_drawing = mp.solutions.drawing_utils
+# Load cascade classifier as fallback
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+)
 
 # Global state
 guardian_state = {
@@ -70,25 +80,12 @@ def _log_event(event_type: str, details: str):
     print(f"[Guardian] 📝 {event_entry}")
 
 
-def _extract_face_embedding(frame, detection):
-    """Extract face embedding from a detected face using bounding box."""
-    h, w, c = frame.shape
-    bbox = detection.location_data.relative_bounding_box
-    
-    # Convert relative coordinates to pixel coordinates
-    x_min = int(bbox.xmin * w)
-    y_min = int(bbox.ymin * h)
-    x_max = int((bbox.xmin + bbox.width) * w)
-    y_max = int((bbox.ymin + bbox.height) * h)
-    
-    # Ensure coordinates are within bounds
-    x_min = max(0, x_min)
-    y_min = max(0, y_min)
-    x_max = min(w, x_max)
-    y_max = min(h, y_max)
+def _extract_face_embedding(frame, face_rect):
+    """Extract face embedding from a detected face region."""
+    x, y, w, h = face_rect
     
     # Extract face region
-    face_region = frame[y_min:y_max, x_min:x_max]
+    face_region = frame[y:y+h, x:x+w]
     
     # Simple embedding: average RGB values + histogram
     if face_region.size > 0:
@@ -119,28 +116,24 @@ def learn_face(player=None) -> str:
         face_embeddings = []
         start_time = time.time()
         
-        with mp_face_detection.FaceDetection(
-            model_selection=0, min_detection_confidence=0.5) as face_detection:
+        while time.time() - start_time < 3:
+            ret, frame = cap.read()
+            if not ret:
+                break
             
-            while time.time() - start_time < 3:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                # Convert to RGB
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = face_detection.process(rgb_frame)
-                
-                if results.detections:
-                    for detection in results.detections:
-                        embedding = _extract_face_embedding(frame, detection)
-                        if embedding is not None:
-                            face_embeddings.append(embedding)
-                
-                # Show preview
-                cv2.imshow("Face Registration", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
+            # Find faces using Haar Cascade
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+            
+            for face_rect in faces:
+                embedding = _extract_face_embedding(frame, face_rect)
+                if embedding is not None:
+                    face_embeddings.append(embedding)
+            
+            # Show preview
+            cv2.imshow("Face Registration", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
         
         cap.release()
         cv2.destroyAllWindows()
@@ -212,48 +205,44 @@ def _monitor_room(player=None):
     
     print("[Guardian] 🎥 Monitoring started")
     
-    with mp_face_detection.FaceDetection(
-        model_selection=0, min_detection_confidence=0.5) as face_detection:
+    while guardian_state["active"]:
+        ret, frame = cap.read()
+        if not ret:
+            break
         
-        while guardian_state["active"]:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        # Find faces using Haar Cascade
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        
+        for face_rect in faces:
+            embedding = _extract_face_embedding(frame, face_rect)
             
-            # Convert to RGB
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = face_detection.process(rgb_frame)
-            
-            if results.detections:
-                for detection in results.detections:
-                    embedding = _extract_face_embedding(frame, detection)
+            if embedding is not None and guardian_state["user_face_embedding"] is not None:
+                # Calculate distance between embeddings
+                dist = distance.euclidean(embedding, guardian_state["user_face_embedding"])
+                
+                # If distance is small, it's the user
+                if dist < 20:  # Threshold for similarity
+                    event_msg = "You detected in room"
+                    _log_event("USER_DETECTED", event_msg)
+                    guardian_state["last_detection"] = {
+                        "type": "user",
+                        "time": datetime.now()
+                    }
+                else:
+                    # Unknown person
+                    event_msg = "Unknown person detected in room!"
+                    _log_event("UNKNOWN_DETECTED", event_msg)
                     
-                    if embedding is not None and guardian_state["user_face_embedding"] is not None:
-                        # Calculate distance between embeddings
-                        dist = distance.euclidean(embedding, guardian_state["user_face_embedding"])
-                        
-                        # If distance is small, it's the user
-                        if dist < 20:  # Threshold for similarity
-                            event_msg = "You detected in room"
-                            _log_event("USER_DETECTED", event_msg)
-                            guardian_state["last_detection"] = {
-                                "type": "user",
-                                "time": datetime.now()
-                            }
-                        else:
-                            # Unknown person
-                            event_msg = "Unknown person detected in room!"
-                            _log_event("UNKNOWN_DETECTED", event_msg)
-                            
-                            if player:
-                                player.ui.write_log(f"⚠️ {event_msg}")
-                            
-                            guardian_state["last_detection"] = {
-                                "type": "unknown",
-                                "time": datetime.now()
-                            }
-            
-            time.sleep(1)  # Check every second
+                    if player:
+                        player.ui.write_log(f"⚠️ {event_msg}")
+                    
+                    guardian_state["last_detection"] = {
+                        "type": "unknown",
+                        "time": datetime.now()
+                    }
+        
+        time.sleep(1)  # Check every second
     
     cap.release()
     print("[Guardian] 🎥 Monitoring stopped")
