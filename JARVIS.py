@@ -31,6 +31,7 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
+from actions.room_guardian     import room_guardian
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -349,6 +350,26 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "room_guardian",
+        "description": (
+            "Smart room security system with face recognition. "
+            "Use for: registering your face, activating room monitoring when you leave, "
+            "getting welcome-back reports when you return, and checking guardian status. "
+            "Actions: learn_face (register face), start (activate monitoring), "
+            "stop (deactivate), report (get welcome report), status (check status)."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "learn_face | start | stop | report | status"
+                }
+            },
+            "required": ["action"]
+        }
+    },
+    {
         "name": "shutdown_jarvis",
         "description": (
             "Shuts down the assistant completely. "
@@ -652,6 +673,7 @@ class JarvisLive:
             elif name == "web_search":
                 r = await loop.run_in_executor(None, lambda: web_search_action(parameters=args, player=self.ui))
                 result = r or "Done."
+
             elif name == "file_processor":
                 if not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
@@ -671,6 +693,10 @@ class JarvisLive:
 
             elif name == "flight_finder":
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "room_guardian":
+                r = await loop.run_in_executor(None, lambda: room_guardian(parameters=args, player=self.ui, speak=self.speak))
                 result = r or "Done."
 
             elif name == "image_generator":
